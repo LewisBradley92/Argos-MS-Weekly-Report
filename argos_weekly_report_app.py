@@ -5,6 +5,7 @@ import unicodedata
 from difflib import SequenceMatcher
 
 import pandas as pd
+import openpyxl
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -59,12 +60,73 @@ def copy_cell_style(source, target):
     if source.protection:
         target.protection = copy(source.protection)
 
-def build_outputs(template_bytes, csv_bytes):
+def build_outputs(template_bytes, csv_bytes, store_db_bytes):
     """Update only Raw Data in the LIVE workbook, append unseen audits, and extend Summary detail formulas."""
     try:
         audit_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=object, keep_default_na=False, encoding="utf-8-sig")
     except UnicodeDecodeError:
         audit_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=object, keep_default_na=False, encoding="cp1252")
+
+    # Load store database and build lookups by postcode and store name.
+    store_wb = load_workbook(io.BytesIO(store_db_bytes), data_only=True, read_only=True)
+    store_sheet_name = next((name for name in store_wb.sheetnames if "store listing" in name.lower()), store_wb.sheetnames[0])
+    store_ws = store_wb[store_sheet_name]
+    store_rows = store_ws.iter_rows(values_only=True)
+    db_headers = next(store_rows, ())
+    db_index = {norm(header): idx for idx, header in enumerate(db_headers) if header is not None}
+    required = ("postcode", "storename", "region", "district")
+    if not all(key in db_index for key in required):
+        store_wb.close()
+        raise ValueError("The store database must contain Store Name, Post Code, Region and District columns.")
+
+    region_by_postcode = {}
+    region_by_name = {}
+    for db_row in store_rows:
+        postcode = norm(db_row[db_index["postcode"]]) if db_row[db_index["postcode"]] is not None else ""
+        store_name = norm(db_row[db_index["storename"]]) if db_row[db_index["storename"]] is not None else ""
+        region = db_row[db_index["region"]]
+        district = db_row[db_index["district"]]
+        if postcode:
+            region_by_postcode[postcode] = (region, district)
+        if store_name:
+            region_by_name[store_name] = (region, district)
+    store_wb.close()
+
+    # Match audit rows to the store database by site_internal_id (preferred key).
+    # Keep postcode/name as fallbacks only when the ID field is unavailable in either file.
+    db_id_col = next((key for key in db_index if key in ("siteinternalid", "internalid")), None)
+    region_by_site_id = {}
+    if db_id_col:
+        id_wb = load_workbook(io.BytesIO(store_db_bytes), data_only=True, read_only=True)
+        id_ws = id_wb[store_sheet_name]
+        for db_row in id_ws.iter_rows(values_only=True, min_row=2):
+            site_id = db_row[db_index[db_id_col]]
+            if site_id is not None and str(site_id).strip():
+                region_by_site_id[str(site_id).strip().casefold()] = (
+                    db_row[db_index["region"]], db_row[db_index["district"]]
+                )
+        id_wb.close()
+
+    audit_id_col = next((col for col in audit_df.columns if norm(col) == "siteinternalid"), None)
+    post_col = next((col for col in audit_df.columns if norm(col) in ("sitepostcode", "postcode")), None)
+    name_col = next((col for col in audit_df.columns if norm(col) in ("sitename", "storename")), None)
+    if "Region" not in audit_df.columns:
+        audit_df["Region"] = ""
+    if "District" not in audit_df.columns:
+        audit_df["District"] = ""
+    for ridx, record in audit_df.iterrows():
+        match = None
+        if audit_id_col and db_id_col:
+            site_id = str(record.get(audit_id_col, "")).strip().casefold()
+            if site_id:
+                match = region_by_site_id.get(site_id)
+        if not match and post_col:
+            match = region_by_postcode.get(norm(record.get(post_col, "")))
+        if not match and name_col:
+            match = region_by_name.get(norm(record.get(name_col, "")))
+        if match:
+            audit_df.at[ridx, "Region"] = match[0] if match[0] is not None else ""
+            audit_df.at[ridx, "District"] = match[1] if match[1] is not None else ""
 
     wb = load_workbook(io.BytesIO(template_bytes))
     if "Raw Data" not in wb.sheetnames:
@@ -132,13 +194,17 @@ def build_outputs(template_bytes, csv_bytes):
             cell = raw_ws.cell(row_idx, col_idx, value=value)
             # Every appended audit row inherits the canonical first data-row formatting.
             if row_idx > 2:
-                copy_cell_style(raw_ws.cell(2, col_idx), cell)
+                style_row = 6 if raw_ws.max_row >= 6 else 2
+                copy_cell_style(raw_ws.cell(style_row, col_idx), cell)
         # Match row height exactly to the template's first data row, rather than inheriting
         # a potentially irregular height from a preceding record.
-        template_height = raw_ws.row_dimensions[2].height
+        # The LIVE workbook's actual audit rows start at row 6 (rows 2-5 are layout/blank rows).
+        # Row 6 has the intended display height; copy it explicitly to every new audit row.
+        template_data_row = 6 if raw_ws.max_row >= 6 else 2
+        template_height = raw_ws.row_dimensions[template_data_row].height
         if template_height is not None:
             raw_ws.row_dimensions[row_idx].height = template_height
-        raw_ws.row_dimensions[row_idx].hidden = raw_ws.row_dimensions[2].hidden
+        raw_ws.row_dimensions[row_idx].hidden = raw_ws.row_dimensions[template_data_row].hidden
 
     raw_ws.freeze_panes = "A2"
 
@@ -166,6 +232,18 @@ def build_outputs(template_bytes, csv_bytes):
                 elif summary_row != source_row:
                     target_cell.value = source_cell.value
 
+        # Link Summary Region and District columns to the actual matching headers in Raw Data.
+        raw_header_cols = {norm(raw_ws.cell(1, c).value): c for c in range(1, raw_ws.max_column + 1) if raw_ws.cell(1, c).value}
+        summary_header_cols = {norm(summary_ws.cell(19, c).value): c for c in range(1, summary_ws.max_column + 1) if summary_ws.cell(19, c).value}
+        for label in ("region", "district"):
+            raw_col = raw_header_cols.get(label)
+            summary_col = summary_header_cols.get(label)
+            if raw_col and summary_col:
+                raw_letter = openpyxl.utils.get_column_letter(raw_col)
+                for summary_row in range(summary_first_row, summary_last_row + 1):
+                    raw_row = summary_row - summary_first_row + 2
+                    summary_ws.cell(summary_row, summary_col).value = f'=IF(\'Raw Data\'!{raw_letter}{raw_row}="","-",\'Raw Data\'!{raw_letter}{raw_row})'
+
         # Clear obsolete audit detail rows if the new raw data contains fewer audits than before.
         existing_detail_end = max(summary_ws.max_row, summary_first_row)
         for summary_row in range(summary_last_row + 1, existing_detail_end + 1):
@@ -192,6 +270,7 @@ with st.sidebar:
     st.header("Inputs")
     template_file = st.file_uploader("Weekly Report LIVE workbook (.xlsx)", type=["xlsx"])
     audit_file = st.file_uploader("audit_export (.csv)", type=["csv"])
+    store_database_file = st.file_uploader("Argos Store Database (.xlsx)", type=["xlsx"])
     st.caption("The output workbook keeps the LIVE workbook's existing worksheets and formatting.")
 
 st.subheader("What this app does")
@@ -202,11 +281,11 @@ st.markdown("""
 4. Extends the Summary detail table from row 20 so each raw audit has a matching summary row.
 """)
 
-if template_file and audit_file:
+if template_file and audit_file and store_database_file:
     if st.button("Generate raw workbook", type="primary", use_container_width=True):
         try:
             raw_bytes, added_count, existing_count, mapped_count, template_count, raw_last_row = build_outputs(
-                template_file.getvalue(), audit_file.getvalue()
+                template_file.getvalue(), audit_file.getvalue(), store_database_file.getvalue()
             )
             output_name = "Argos MS Weekly Report Raw Data.xlsx"
             st.session_state["argos_raw_workbook"] = raw_bytes
@@ -234,4 +313,4 @@ if st.session_state.get("argos_raw_workbook"):
         on_click="ignore",
     )
 else:
-    st.info("Upload the LIVE workbook and audit_export CSV in the sidebar to begin.")
+    st.info("Upload the LIVE workbook, audit_export CSV, and Argos Store Database workbook to begin.")
