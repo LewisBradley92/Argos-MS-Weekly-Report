@@ -1,3 +1,131 @@
+import io
+import zipfile
+import re
+import unicodedata
+from datetime import date, datetime
+from difflib import SequenceMatcher
+
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+st.set_page_config(page_title="Argos MS Weekly Report", page_icon="📊", layout="wide")
+st.title("Argos MS Weekly Report Builder")
+st.caption("Add the latest audit export to the weekly-report template and download the raw data and finished report.")
+
+def norm(value):
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKC", str(value)).strip().lower()
+    text = text.replace("£", "pounds").replace("€", "euros")
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^a-z0-9]+", "", text)
+    return text
+
+def find_header_mapping(template_headers, source_headers):
+    """Map source columns to template columns by normalized header, then cautious fuzzy match."""
+    source_by_norm = {}
+    for source in source_headers:
+        key = norm(source)
+        if key and key not in source_by_norm:
+            source_by_norm[key] = source
+    mapping = {}
+    for target in template_headers:
+        key = norm(target)
+        if not key:
+            continue
+        if key in source_by_norm:
+            mapping[target] = source_by_norm[key]
+            continue
+        # Only accept high-confidence fuzzy matches, to avoid putting data under the wrong question.
+        candidates = [(SequenceMatcher(None, key, norm(s)).ratio(), s) for s in source_headers if norm(s)]
+        if candidates:
+            score, candidate = max(candidates, key=lambda x: x[0])
+            if score >= 0.96:
+                mapping[target] = candidate
+    return mapping
+
+def copy_cell_style(source, target):
+    # StyleProxy objects are not hashable; copy the underlying style components.
+    from copy import copy
+    if source.has_style:
+        target._style = copy(source._style)
+    if source.number_format:
+        target.number_format = source.number_format
+    if source.alignment:
+        target.alignment = copy(source.alignment)
+    if source.protection:
+        target.protection = copy(source.protection)
+
+def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_date):
+    # Read the export as strings first so identifiers, leading zeroes and free-text are retained.
+    try:
+        audit_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=object, keep_default_na=False, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        audit_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=object, keep_default_na=False, encoding="cp1252")
+
+    wb = load_workbook(io.BytesIO(template_bytes))
+    if "Raw Data" not in wb.sheetnames:
+        raise ValueError("The weekly-report template must contain a 'Raw Data' sheet.")
+    ws = wb["Raw Data"]
+
+    # Row 1 in the live workbook defines the canonical column order. Never reorder these columns.
+    template_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    source_headers = list(audit_df.columns)
+    mapping = find_header_mapping(template_headers, source_headers)
+
+    # Clear old data but preserve the template header, column positions, widths and formatting.
+    if ws.max_row >= 2:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    # Append rows by template column, never by source-file position.
+    for row_idx, (_, record) in enumerate(audit_df.iterrows(), start=2):
+        for col_idx, target_header in enumerate(template_headers, start=1):
+            if target_header is None or target_header not in mapping:
+                continue
+            source_header = mapping[target_header]
+            value = record.get(source_header, "")
+            if value == "":
+                value = None
+            # Convert common date fields to Excel dates where safely parseable; otherwise retain source text.
+            if value is not None and any(token in norm(target_header) for token in ("date", "deadline")):
+                parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+                if not pd.isna(parsed):
+                    value = parsed.to_pydatetime()
+            cell = ws.cell(row_idx, col_idx, value=value)
+            if row_idx > 2:
+                copy_cell_style(ws.cell(2, col_idx), cell)
+        # Copy row height from the first data row if available.
+        if ws.row_dimensions[2].height:
+            ws.row_dimensions[row_idx].height = ws.row_dimensions[2].height
+
+    ws.freeze_panes = "A2"
+    # Ensure the workbook's calculation engine recalculates formulas when opened.
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
+
+    # Use the provided past report as the visual/value reference for the Summary tab.
+    # The live template's Summary tab is retained so its layout, formulas and formatting stay intact.
+    # If the reference workbook has a Summary sheet, copy its layout/formatting only where the live
+    # template is missing a Summary sheet; do not reuse last week's stale values.
+    if "Summary" not in wb.sheetnames:
+        ref_wb = load_workbook(io.BytesIO(summary_reference_bytes), data_only=True)
+        if "Summary" in ref_wb.sheetnames:
+            ref_ws = ref_wb["Summary"]
+            out_ws = wb.create_sheet("Summary")
+            for row in ref_ws.iter_rows():
+                for cell in row:
+                    out = out_ws.cell(cell.row, cell.column, value=cell.value)
+                    copy_cell_style(cell, out)
+
+    # Save the raw workbook first. It remains a full copy of the LIVE workbook with only
+    # the Raw Data sheet refreshed, so all other worksheets are retained.
     expected_sheet_names = list(wb.sheetnames)
     raw_xlsx_io = io.BytesIO()
     wb.save(raw_xlsx_io)
