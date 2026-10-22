@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.formula.translate import Translator
 
 st.set_page_config(page_title="Argos MS Weekly Report", page_icon="📊", layout="wide")
 st.title("Argos MS Weekly Report Builder")
@@ -60,7 +61,7 @@ def copy_cell_style(source, target):
         target.protection = copy(source.protection)
 
 def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_date):
-    # Read the export as strings first so identifiers, leading zeroes and free-text are retained.
+    """Update only Raw Data in the LIVE workbook, append unseen audits, and extend Summary detail formulas."""
     try:
         audit_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=object, keep_default_na=False, encoding="utf-8-sig")
     except UnicodeDecodeError:
@@ -68,20 +69,56 @@ def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_dat
 
     wb = load_workbook(io.BytesIO(template_bytes))
     if "Raw Data" not in wb.sheetnames:
-        raise ValueError("The weekly-report template must contain a 'Raw Data' sheet.")
-    ws = wb["Raw Data"]
+        raise ValueError("The LIVE workbook must contain a 'Raw Data' sheet.")
+    if "Summary" not in wb.sheetnames:
+        raise ValueError("The LIVE workbook must contain a 'Summary' sheet.")
 
-    # Row 1 in the live workbook defines the canonical column order. Never reorder these columns.
-    template_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    raw_ws = wb["Raw Data"]
+    summary_ws = wb["Summary"]
+    template_headers = [raw_ws.cell(1, c).value for c in range(1, raw_ws.max_column + 1)]
     source_headers = list(audit_df.columns)
     mapping = find_header_mapping(template_headers, source_headers)
 
-    # Clear old data but preserve the template header, column positions, widths and formatting.
-    if ws.max_row >= 2:
-        ws.delete_rows(2, ws.max_row - 1)
+    # Use audit ID (internal_id) to prevent duplicates. Fall back to a composite key if absent.
+    def source_key(record):
+        for h in source_headers:
+            if norm(h) == "internalid":
+                value = str(record.get(h, "")).strip()
+                if value:
+                    return ("audit_id", value.casefold())
+        return tuple(str(record.get(h, "")).strip().casefold() for h in source_headers[:min(8, len(source_headers))])
 
-    # Append rows by template column, never by source-file position.
-    for row_idx, (_, record) in enumerate(audit_df.iterrows(), start=2):
+    audit_id_col = next((h for h in source_headers if norm(h) == "internalid"), None)
+    if audit_id_col is None:
+        raise ValueError("The audit export needs an 'internal_id' column so existing audits can be deduplicated safely.")
+
+    existing_keys = set()
+    for row in range(2, raw_ws.max_row + 1):
+        existing_id = raw_ws.cell(row, 4).value  # internal_id is column D in the LIVE template
+        if existing_id is not None and str(existing_id).strip():
+            existing_keys.add(str(existing_id).strip().casefold())
+
+    # Preserve existing rows; append only audits not already in Raw Data.
+    seen_in_export = set()
+    new_records = []
+    for _, record in audit_df.iterrows():
+        audit_id = str(record.get(audit_id_col, "")).strip()
+        if not audit_id:
+            continue
+        key = audit_id.casefold()
+        if key in existing_keys or key in seen_in_export:
+            continue
+        seen_in_export.add(key)
+        new_records.append(record)
+
+    append_start = raw_ws.max_row + 1
+    # If the workbook contains formatted but empty rows, find the first genuinely empty row after data.
+    while append_start > 2 and all(raw_ws.cell(append_start - 1, c).value is None for c in range(1, raw_ws.max_column + 1)):
+        append_start -= 1
+
+    # Preserve the existing column order. Map by heading; unmatched template columns remain blank.
+    for offset, record in enumerate(new_records):
+        row_idx = append_start + offset
         for col_idx, target_header in enumerate(template_headers, start=1):
             if target_header is None or target_header not in mapping:
                 continue
@@ -89,20 +126,54 @@ def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_dat
             value = record.get(source_header, "")
             if value == "":
                 value = None
-            # Convert common date fields to Excel dates where safely parseable; otherwise retain source text.
             if value is not None and any(token in norm(target_header) for token in ("date", "deadline")):
                 parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
                 if not pd.isna(parsed):
                     value = parsed.to_pydatetime()
-            cell = ws.cell(row_idx, col_idx, value=value)
+            cell = raw_ws.cell(row_idx, col_idx, value=value)
+            # Match formatting to the previous data row, without changing existing cells.
             if row_idx > 2:
-                copy_cell_style(ws.cell(2, col_idx), cell)
-        # Copy row height from the first data row if available.
-        if ws.row_dimensions[2].height:
-            ws.row_dimensions[row_idx].height = ws.row_dimensions[2].height
+                copy_cell_style(raw_ws.cell(row_idx - 1, col_idx), cell)
+        if raw_ws.row_dimensions[max(2, row_idx - 1)].height:
+            raw_ws.row_dimensions[row_idx].height = raw_ws.row_dimensions[max(2, row_idx - 1)].height
 
-    ws.freeze_panes = "A2"
-    # Ensure the workbook's calculation engine recalculates formulas when opened.
+    raw_ws.freeze_panes = "A2"
+
+    # Summary detail starts at row 20, with one row per Raw Data audit (Raw Data row 2 -> Summary row 20).
+    # Extend formulas and formatting down to cover every raw audit, without leaving stale detail rows.
+    raw_last_row = raw_ws.max_row
+    audit_count = max(0, raw_last_row - 1)
+    summary_first_row = 20
+    summary_last_row = summary_first_row + audit_count - 1
+
+    # The workbook's existing row 20 is the formula/style template for the audit detail table.
+    if audit_count:
+        for summary_row in range(summary_first_row, summary_last_row + 1):
+            source_row = summary_first_row if summary_row == summary_first_row else summary_first_row
+            for col_idx in range(1, summary_ws.max_column + 1):
+                source_cell = summary_ws.cell(source_row, col_idx)
+                target_cell = summary_ws.cell(summary_row, col_idx)
+                if summary_row != source_row:
+                    copy_cell_style(source_cell, target_cell)
+                if isinstance(source_cell.value, str) and source_cell.value.startswith("="):
+                    try:
+                        target_cell.value = Translator(source_cell.value, origin=source_cell.coordinate).translate_formula(target_cell.coordinate)
+                    except Exception:
+                        target_cell.value = source_cell.value
+                elif summary_row != source_row:
+                    target_cell.value = source_cell.value
+
+        # Clear obsolete audit detail rows if the new raw data contains fewer audits than before.
+        existing_detail_end = max(summary_ws.max_row, summary_first_row)
+        for summary_row in range(summary_last_row + 1, existing_detail_end + 1):
+            for col_idx in range(1, summary_ws.max_column + 1):
+                summary_ws.cell(summary_row, col_idx).value = None
+    else:
+        for summary_row in range(summary_first_row, max(summary_ws.max_row, summary_first_row) + 1):
+            for col_idx in range(1, summary_ws.max_column + 1):
+                summary_ws.cell(summary_row, col_idx).value = None
+
+    # Recalculate formulas when the workbook is opened in Excel.
     try:
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
@@ -110,86 +181,9 @@ def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_dat
     except Exception:
         pass
 
-    # Use the provided past report as the visual/value reference for the Summary tab.
-    # The live template's Summary tab is retained so its layout, formulas and formatting stay intact.
-    # If the reference workbook has a Summary sheet, copy its layout/formatting only where the live
-    # template is missing a Summary sheet; do not reuse last week's stale values.
-    if "Summary" not in wb.sheetnames:
-        ref_wb = load_workbook(io.BytesIO(summary_reference_bytes), data_only=True)
-        if "Summary" in ref_wb.sheetnames:
-            ref_ws = ref_wb["Summary"]
-            out_ws = wb.create_sheet("Summary")
-            for row in ref_ws.iter_rows():
-                for cell in row:
-                    out = out_ws.cell(cell.row, cell.column, value=cell.value)
-                    copy_cell_style(cell, out)
-
-    # Save the raw workbook first. It remains a full copy of the LIVE workbook with only
-    # the Raw Data sheet refreshed, so all other worksheets are retained.
-    expected_sheet_names = list(wb.sheetnames)
-    raw_xlsx_io = io.BytesIO()
-    wb.save(raw_xlsx_io)
-    raw_workbook_bytes = raw_xlsx_io.getvalue()
-    # Verify that every original worksheet is still present in the raw workbook.
-    check_wb = load_workbook(io.BytesIO(raw_workbook_bytes), read_only=True, data_only=False)
-    missing_sheets = [name for name in expected_sheet_names if name not in check_wb.sheetnames]
-    check_wb.close()
-    if missing_sheets:
-        raise ValueError("The raw workbook is missing worksheet(s): " + ", ".join(missing_sheets))
-
-    # Build the final report from the refreshed workbook, but keep it distinct from the raw workbook.
-    # LibreOffice is required here to calculate Excel formulas before converting formula cells to values.
-    import shutil, subprocess, tempfile, os
-    lo = shutil.which("libreoffice") or shutil.which("soffice")
-    if not lo:
-        raise RuntimeError(
-            "Cannot update the Summary automatically because LibreOffice is not installed in this "
-            "environment. Install LibreOffice on the machine running Streamlit, then restart the app. "
-            "The raw workbook is preserved, but the final report is not generated with stale Summary values."
-        )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        input_path = os.path.join(tmp, "weekly_input.xlsx")
-        output_dir = os.path.join(tmp, "recalculated")
-        os.makedirs(output_dir)
-        with open(input_path, "wb") as f:
-            f.write(raw_workbook_bytes)
-
-        result = subprocess.run(
-            [lo, "--headless", "--convert-to", "xlsx", "--outdir", output_dir, input_path],
-            capture_output=True, text=True, timeout=120
-        )
-        recalculated = os.path.join(output_dir, "weekly_input.xlsx")
-        if not os.path.exists(recalculated):
-            detail = (result.stderr or result.stdout or "No recalculated workbook was produced.").strip()
-            raise RuntimeError("LibreOffice could not recalculate the workbook: " + detail)
-
-        # Load one copy with calculated results and one with formulas/styles.
-        calculated_wb = load_workbook(recalculated, data_only=True)
-        final_wb = load_workbook(recalculated, data_only=False)
-
-        # Replace formulas with the freshly calculated results in every sheet that remains.
-        # This includes Summary and Pack Data, so neither depends on the removed Raw Data tab.
-        for sheet_name in final_wb.sheetnames:
-            if sheet_name not in calculated_wb.sheetnames:
-                continue
-            formula_ws = final_wb[sheet_name]
-            value_ws = calculated_wb[sheet_name]
-            for row in formula_ws.iter_rows():
-                for cell in row:
-                    if isinstance(cell.value, str) and cell.value.startswith("="):
-                        cell.value = value_ws.cell(cell.row, cell.column).value
-
-        # The final weekly report is the presentation workbook, not the raw-data workbook.
-        # Remove Raw Data only from this final version; the raw workbook retains every original tab.
-        if "Raw Data" in final_wb.sheetnames:
-            del final_wb["Raw Data"]
-        final_io = io.BytesIO()
-        final_wb.save(final_io)
-        values_only_bytes = final_io.getvalue()
-        summary_values_only = True
-
-    return raw_workbook_bytes, values_only_bytes, len(audit_df), len(mapping), len(template_headers), summary_values_only
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), len(new_records), len(existing_keys), len(mapping), len(template_headers), raw_last_row
 
 with st.sidebar:
     st.header("Inputs")
@@ -201,53 +195,44 @@ with st.sidebar:
 
 st.subheader("What this app does")
 st.markdown("""
-1. Keeps the **Raw Data** columns in the exact order used by the LIVE workbook.
-2. Matches audit-export fields to the correct report columns by header, not by column position.
-3. The raw workbook retains every original tab and refreshes only Raw Data.
-4. The final weekly report has updated, values-only Summary and Pack Data tabs, and does not include the Raw Data tab. Both files are packaged into one ZIP download.
+1. Uses the LIVE workbook as the only output workbook and preserves all tabs.
+2. Adds only audit records not already present, deduplicating by `internal_id`.
+3. Keeps the Raw Data columns in their existing order.
+4. Extends the Summary detail table from row 20 so each raw audit has a matching summary row.
 """)
 
 if template_file and audit_file:
-    if st.button("Generate both files", type="primary", use_container_width=True):
+    if st.button("Generate raw workbook", type="primary", use_container_width=True):
         try:
-            ref_bytes = reference_file.getvalue() if reference_file else template_file.getvalue()
-            raw_bytes, report_bytes, row_count, mapped_count, template_count, summary_values_only = build_outputs(
-                template_file.getvalue(), audit_file.getvalue(), ref_bytes, report_day
+            raw_bytes, added_count, existing_count, mapped_count, template_count, raw_last_row = build_outputs(
+                template_file.getvalue(), audit_file.getvalue(),
+                reference_file.getvalue() if reference_file else template_file.getvalue(),
+                report_day
             )
-            report_name = f"Argos MS Weekly Report {report_day.strftime('%d.%m')}.xlsx"
-            raw_name = f"Argos MS Weekly Report Raw Data {report_day.strftime('%d.%m')}.xlsx"
-            zip_name = f"Argos MS Weekly Report Files {report_day.strftime('%d.%m')}.zip"
-            bundle = io.BytesIO()
-            with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr(raw_name, raw_bytes)
-                archive.writestr(report_name, report_bytes)
-
-            st.session_state["argos_report_bundle"] = bundle.getvalue()
-            st.session_state["argos_report_zip_name"] = zip_name
-            st.session_state["argos_report_stats"] = (row_count, mapped_count, template_count, summary_values_only)
-            st.success("Both workbooks have been generated.")
+            output_name = f"Argos MS Weekly Report Raw Data {report_day.strftime('%d.%m')}.xlsx"
+            st.session_state["argos_raw_workbook"] = raw_bytes
+            st.session_state["argos_raw_filename"] = output_name
+            st.session_state["argos_raw_stats"] = (added_count, existing_count, mapped_count, template_count, raw_last_row)
+            st.success("Raw workbook generated. All original tabs have been retained.")
         except Exception as exc:
-            st.error(f"Could not generate the files: {exc}")
+            st.error(f"Could not generate the file: {exc}")
 
-# Keep the download control available after Streamlit reruns, rather than nesting it inside
-# the Generate button event. A single ZIP download avoids browsers blocking multiple downloads.
-if st.session_state.get("argos_report_bundle"):
-    row_count, mapped_count, template_count, summary_values_only = st.session_state["argos_report_stats"]
-    st.info(f"Processed {row_count:,} audit rows. Matched {mapped_count} of {template_count} template columns.")
-    if summary_values_only:
-        st.info("Summary formulas were recalculated and replaced with values.")
-    else:
-        st.warning("This environment could not recalculate Excel formulas automatically. The weekly report may still contain Summary formulas; open it in Excel and allow recalculation before sharing.")
+if st.session_state.get("argos_raw_workbook"):
+    added_count, existing_count, mapped_count, template_count, raw_last_row = st.session_state["argos_raw_stats"]
+    st.info(
+        f"Added {added_count} new audit(s); skipped duplicates. "
+        f"Existing unique audit IDs before this run: {existing_count}. "
+        f"Matched {mapped_count} of {template_count} template columns. "
+        f"Summary detail rows now cover Summary 20 onward for {max(0, raw_last_row - 1)} audit(s)."
+    )
     st.download_button(
-        "Download both files (ZIP)",
-        data=st.session_state["argos_report_bundle"],
-        file_name=st.session_state["argos_report_zip_name"],
-        mime="application/zip",
+        "Download updated raw workbook",
+        data=st.session_state["argos_raw_workbook"],
+        file_name=st.session_state["argos_raw_filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True,
         on_click="ignore",
     )
-    with st.expander("Column mapping check"):
-        st.write("The raw workbook retains all original tabs and refreshes only Raw Data. The final report is recalculated first, converts formulas to their current values, and then removes the Raw Data tab. Both workbooks are in the ZIP.")
 else:
-    st.info("Upload the LIVE workbook and audit_export CSV in the sidebar to begin. The previous completed report is optional and is used as a reference.")
+    st.info("Upload the LIVE workbook and audit_export CSV in the sidebar to begin. The previous completed report is optional.")
