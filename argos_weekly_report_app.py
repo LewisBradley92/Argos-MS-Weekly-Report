@@ -110,10 +110,15 @@ def build_outputs(template_bytes, csv_bytes, store_db_bytes):
     audit_id_col = next((col for col in audit_df.columns if norm(col) == "siteinternalid"), None)
     post_col = next((col for col in audit_df.columns if norm(col) in ("sitepostcode", "postcode")), None)
     name_col = next((col for col in audit_df.columns if norm(col) in ("sitename", "storename")), None)
+    # Assign object dtype so database values (which may be numeric IDs/labels) can be added safely.
     if "Region" not in audit_df.columns:
-        audit_df["Region"] = ""
+        audit_df["Region"] = pd.Series([""] * len(audit_df), index=audit_df.index, dtype=object)
+    else:
+        audit_df["Region"] = audit_df["Region"].astype(object)
     if "District" not in audit_df.columns:
-        audit_df["District"] = ""
+        audit_df["District"] = pd.Series([""] * len(audit_df), index=audit_df.index, dtype=object)
+    else:
+        audit_df["District"] = audit_df["District"].astype(object)
     for ridx, record in audit_df.iterrows():
         match = None
         if audit_id_col and db_id_col:
