@@ -47,14 +47,16 @@ def find_header_mapping(template_headers, source_headers):
     return mapping
 
 def copy_cell_style(source, target):
+    # StyleProxy objects are not hashable; copy the underlying style components.
+    from copy import copy
     if source.has_style:
-        target._style = source._style
+        target._style = copy(source._style)
     if source.number_format:
         target.number_format = source.number_format
     if source.alignment:
-        target.alignment = source.alignment
+        target.alignment = copy(source.alignment)
     if source.protection:
-        target.protection = source.protection
+        target.protection = copy(source.protection)
 
 def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_date):
     # Read the export as strings first so identifiers, leading zeroes and free-text are retained.
