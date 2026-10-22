@@ -2,7 +2,6 @@ import io
 import zipfile
 import re
 import unicodedata
-from datetime import date, datetime
 from difflib import SequenceMatcher
 
 import pandas as pd
@@ -60,7 +59,7 @@ def copy_cell_style(source, target):
     if source.protection:
         target.protection = copy(source.protection)
 
-def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_date):
+def build_outputs(template_bytes, csv_bytes):
     """Update only Raw Data in the LIVE workbook, append unseen audits, and extend Summary detail formulas."""
     try:
         audit_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=object, keep_default_na=False, encoding="utf-8-sig")
@@ -131,11 +130,15 @@ def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_dat
                 if not pd.isna(parsed):
                     value = parsed.to_pydatetime()
             cell = raw_ws.cell(row_idx, col_idx, value=value)
-            # Match formatting to the previous data row, without changing existing cells.
+            # Every appended audit row inherits the canonical first data-row formatting.
             if row_idx > 2:
-                copy_cell_style(raw_ws.cell(row_idx - 1, col_idx), cell)
-        if raw_ws.row_dimensions[max(2, row_idx - 1)].height:
-            raw_ws.row_dimensions[row_idx].height = raw_ws.row_dimensions[max(2, row_idx - 1)].height
+                copy_cell_style(raw_ws.cell(2, col_idx), cell)
+        # Match row height exactly to the template's first data row, rather than inheriting
+        # a potentially irregular height from a preceding record.
+        template_height = raw_ws.row_dimensions[2].height
+        if template_height is not None:
+            raw_ws.row_dimensions[row_idx].height = template_height
+        raw_ws.row_dimensions[row_idx].hidden = raw_ws.row_dimensions[2].hidden
 
     raw_ws.freeze_panes = "A2"
 
@@ -189,9 +192,7 @@ with st.sidebar:
     st.header("Inputs")
     template_file = st.file_uploader("Weekly Report LIVE workbook (.xlsx)", type=["xlsx"])
     audit_file = st.file_uploader("audit_export (.csv)", type=["csv"])
-    reference_file = st.file_uploader("Previous completed report / Summary reference (.xlsx)", type=["xlsx"])
-    report_day = st.date_input("Report date", value=date.today())
-    st.caption("The output filename uses DD.MM, e.g. Argos MS Weekly Report 23.10.")
+    st.caption("The output workbook keeps the LIVE workbook's existing worksheets and formatting.")
 
 st.subheader("What this app does")
 st.markdown("""
@@ -205,11 +206,9 @@ if template_file and audit_file:
     if st.button("Generate raw workbook", type="primary", use_container_width=True):
         try:
             raw_bytes, added_count, existing_count, mapped_count, template_count, raw_last_row = build_outputs(
-                template_file.getvalue(), audit_file.getvalue(),
-                reference_file.getvalue() if reference_file else template_file.getvalue(),
-                report_day
+                template_file.getvalue(), audit_file.getvalue()
             )
-            output_name = f"Argos MS Weekly Report Raw Data {report_day.strftime('%d.%m')}.xlsx"
+            output_name = "Argos MS Weekly Report Raw Data.xlsx"
             st.session_state["argos_raw_workbook"] = raw_bytes
             st.session_state["argos_raw_filename"] = output_name
             st.session_state["argos_raw_stats"] = (added_count, existing_count, mapped_count, template_count, raw_last_row)
@@ -235,4 +234,4 @@ if st.session_state.get("argos_raw_workbook"):
         on_click="ignore",
     )
 else:
-    st.info("Upload the LIVE workbook and audit_export CSV in the sidebar to begin. The previous completed report is optional.")
+    st.info("Upload the LIVE workbook and audit_export CSV in the sidebar to begin.")
