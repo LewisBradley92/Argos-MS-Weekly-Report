@@ -137,43 +137,56 @@ def build_outputs(template_bytes, csv_bytes, summary_reference_bytes, report_dat
     if missing_sheets:
         raise ValueError("The raw workbook is missing worksheet(s): " + ", ".join(missing_sheets))
 
-    # The final weekly report is processed separately so the raw workbook stays unchanged.
-    xlsx_bytes = raw_workbook_bytes
-
-    # Create a values-only Summary tab using LibreOffice when available. The no-LibreOffice
-    # fallback keeps the workbook valid and clearly warns the user that Excel needs to recalculate.
+    # Build the final report from the refreshed workbook, but keep it distinct from the raw workbook.
+    # LibreOffice is required here to calculate Excel formulas before converting formula cells to values.
     import shutil, subprocess, tempfile, os
     lo = shutil.which("libreoffice") or shutil.which("soffice")
-    values_only_bytes = None
-    if lo:
-        with tempfile.TemporaryDirectory() as tmp:
-            input_path = os.path.join(tmp, "weekly.xlsx")
-            output_dir = os.path.join(tmp, "out")
-            os.makedirs(output_dir)
-            with open(input_path, "wb") as f:
-                f.write(xlsx_bytes)
-            result = subprocess.run([lo, "--headless", "--convert-to", "xlsx", "--outdir", output_dir, input_path],
-                                    capture_output=True, text=True, timeout=90)
-            recalculated = os.path.join(output_dir, "weekly.xlsx")
-            if os.path.exists(recalculated):
-                calc_wb = load_workbook(recalculated, data_only=True)
-                formula_wb = load_workbook(recalculated, data_only=False)
-                if "Summary" in calc_wb.sheetnames and "Summary" in formula_wb.sheetnames:
-                    value_ws = calc_wb["Summary"]
-                    formula_ws = formula_wb["Summary"]
-                    for row in formula_ws.iter_rows():
-                        for cell in row:
-                            if isinstance(cell.value, str) and cell.value.startswith("="):
-                                cell.value = value_ws.cell(cell.row, cell.column).value
-                final_io = io.BytesIO()
-                formula_wb.save(final_io)
-                values_only_bytes = final_io.getvalue()
+    if not lo:
+        raise RuntimeError(
+            "Cannot update the Summary automatically because LibreOffice is not installed in this "
+            "environment. Install LibreOffice on the machine running Streamlit, then restart the app. "
+            "The raw workbook is preserved, but the final report is not generated with stale Summary values."
+        )
 
-    if values_only_bytes is None:
-        # Fallback: use the workbook with formulas intact. Streamlit tells the user this fallback was used.
-        values_only_bytes = xlsx_bytes
-        summary_values_only = False
-    else:
+    with tempfile.TemporaryDirectory() as tmp:
+        input_path = os.path.join(tmp, "weekly_input.xlsx")
+        output_dir = os.path.join(tmp, "recalculated")
+        os.makedirs(output_dir)
+        with open(input_path, "wb") as f:
+            f.write(raw_workbook_bytes)
+
+        result = subprocess.run(
+            [lo, "--headless", "--convert-to", "xlsx", "--outdir", output_dir, input_path],
+            capture_output=True, text=True, timeout=120
+        )
+        recalculated = os.path.join(output_dir, "weekly_input.xlsx")
+        if not os.path.exists(recalculated):
+            detail = (result.stderr or result.stdout or "No recalculated workbook was produced.").strip()
+            raise RuntimeError("LibreOffice could not recalculate the workbook: " + detail)
+
+        # Load one copy with calculated results and one with formulas/styles.
+        calculated_wb = load_workbook(recalculated, data_only=True)
+        final_wb = load_workbook(recalculated, data_only=False)
+
+        # Replace formulas with the freshly calculated results in every sheet that remains.
+        # This includes Summary and Pack Data, so neither depends on the removed Raw Data tab.
+        for sheet_name in final_wb.sheetnames:
+            if sheet_name not in calculated_wb.sheetnames:
+                continue
+            formula_ws = final_wb[sheet_name]
+            value_ws = calculated_wb[sheet_name]
+            for row in formula_ws.iter_rows():
+                for cell in row:
+                    if isinstance(cell.value, str) and cell.value.startswith("="):
+                        cell.value = value_ws.cell(cell.row, cell.column).value
+
+        # The final weekly report is the presentation workbook, not the raw-data workbook.
+        # Remove Raw Data only from this final version; the raw workbook retains every original tab.
+        if "Raw Data" in final_wb.sheetnames:
+            del final_wb["Raw Data"]
+        final_io = io.BytesIO()
+        final_wb.save(final_io)
+        values_only_bytes = final_io.getvalue()
         summary_values_only = True
 
     return raw_workbook_bytes, values_only_bytes, len(audit_df), len(mapping), len(template_headers), summary_values_only
@@ -190,8 +203,8 @@ st.subheader("What this app does")
 st.markdown("""
 1. Keeps the **Raw Data** columns in the exact order used by the LIVE workbook.
 2. Matches audit-export fields to the correct report columns by header, not by column position.
-3. Produces two Excel workbooks that retain all the original tabs: a refreshed raw workbook and the final weekly report.
-4. Packages both workbooks into one ZIP download. The completed report is a reference only; last week's summary figures are not copied into the new report.
+3. The raw workbook retains every original tab and refreshes only Raw Data.
+4. The final weekly report has updated, values-only Summary and Pack Data tabs, and does not include the Raw Data tab. Both files are packaged into one ZIP download.
 """)
 
 if template_file and audit_file:
@@ -235,6 +248,6 @@ if st.session_state.get("argos_report_bundle"):
         on_click="ignore",
     )
     with st.expander("Column mapping check"):
-        st.write("The raw workbook is based on the LIVE workbook and retains its Raw Data, Summary, Pack Data, and any other existing tabs. Only the Raw Data sheet's contents are refreshed. The ZIP contains both the raw workbook and the final weekly report.")
+        st.write("The raw workbook retains all original tabs and refreshes only Raw Data. The final report is recalculated first, converts formulas to their current values, and then removes the Raw Data tab. Both workbooks are in the ZIP.")
 else:
     st.info("Upload the LIVE workbook and audit_export CSV in the sidebar to begin. The previous completed report is optional and is used as a reference.")
